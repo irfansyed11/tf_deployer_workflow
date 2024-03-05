@@ -1,0 +1,231 @@
+name: Deploy Matrix
+run-name: Deploy ${{ github.event.inputs.type }} in Sub-Environment ${{ github.event.inputs.subEnvironment }} - Layer ${{ github.event.inputs.currentLayer }}
+
+permissions:
+  actions: write
+  id-token: write
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      matrix:
+        description: 'JSON list of list of tiers- like [["a","b"],["c","d"],["e"]]'
+        required: true
+      type:
+        required: true
+        description: "Type of content to deployed"
+        type: choice
+        options:
+          - applications
+          - common-tier
+          - common-subenv
+          - public_load_balancers
+      tier:
+        description: 'Target Tier'     
+        required: true
+        type: choice
+        options:
+          - production
+          - non-production
+          - "null"
+      subEnvironment:
+        description: 'Sub-Environment to Target'
+        required: true
+      currentLayer:
+        description: 'Current processing index of the array'
+        required: true
+        default: '1'
+      auto-approve:
+        description: "Whether to auto-approve the apply or not"
+        type: choice
+        options:
+          - "true"
+          - "false"
+        required: true
+      update-sdlc:
+        description: "Whether to update sdlc"
+        type: choice
+        options:
+          - "false"
+          - "true"
+        required: true
+
+
+jobs:
+  ##############################################
+  parse-and-build:
+    name: Parse and Build Matrix for ${{ github.event.inputs.type }} in ${{ github.event.inputs.subEnvironment }}
+    runs-on: ubuntu-latest
+    outputs:
+      nextLayer: ${{ steps.get-matrix.outputs.NEXT_LAYER }}
+      applicationMatrix: ${{ steps.get-matrix.outputs.APPLICATION_MATRIX }}
+      layerCount: ${{ steps.get-array-length.outputs.TOTAL_LENGTH }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get GitHub Apps Token # This enables access to Terraform modules in internal/private repos
+      id: get_token
+      uses: tibdex/github-app-token@v1.7.0
+      with:
+        private_key: ${{ secrets.ORG_REPO_READ_PRIVATE_KEY }}
+        app_id: ${{ secrets.ORG_REPO_READ_APP_ID }}
+      # Doc: https://github.com/marketplace/actions/github-app-token
+
+    - name: Get array length and calculate element count
+      id: get-array-length
+      run: |
+        LENGTH=$(echo '${{ github.event.inputs.matrix }}' | jq '. | length')
+        echo "TOTAL_LENGTH=$LENGTH" >> "$GITHUB_OUTPUT"
+
+    - name: Parse current array and get paths and target accounts for applications
+      id: get-matrix
+      env:
+        GITHUB_TOKEN: ${{ steps.get_token.outputs.token }}      
+      run: |
+        applications='${{ github.event.inputs.matrix }}'                            # Payload of nested lists, like [["springboot-aircraft", "foobar", "..."]]
+
+        CURRENT_INDEX=$((${{ github.event.inputs.currentLayer }}-1))                # Index of the nested list item being processed
+        NEXT_LAYER=$((${{ github.event.inputs.currentLayer }} + 1))                 # Index of the next nested list item that will be processed in the next iteration
+        echo "NEXT_LAYER=$NEXT_LAYER" >> "$GITHUB_OUTPUT"                           # Persist the next later index, for downstream consumption
+
+        CURRENT_ARRAY=$(echo "$applications" | jq ".[$CURRENT_INDEX] | tojson")     # Serializes the list of current applications to JSON
+
+        echo subenvironment is ${{ github.event.inputs.subEnvironment }}
+        echo tier is ${{ github.event.inputs.tier }}
+        
+        # Use the Account Lookup script to build the application matrix
+        application_matrix=$(python3 ./docs/scripts/account_lookup/account_lookup.py --env prod-control-tower --type ${{ github.event.inputs.type }} --app-list "$CURRENT_ARRAY" --subenv ${{ github.event.inputs.subEnvironment }} --tier ${{ github.event.inputs.tier }})
+       
+        jq . <<< $application_matrix  # Pretty Print the application matrix JSON
+        echo "APPLICATION_MATRIX=$application_matrix" >> "$GITHUB_OUTPUT"           # Persist the application matrix
+
+
+
+  ##############################################
+  terraform-apply:
+    name: 🚀 ${{ matrix.application.Application }} ► ${{ matrix.application.AccountName }}
+    needs: parse-and-build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        application: ${{fromJson(needs.parse-and-build.outputs.applicationMatrix)}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Print Matrix Values
+        run: |
+          echo "Application: ${{ matrix.application.Application }}"
+          echo "Path: ${{ matrix.application.Path }}"
+          echo "AccountId: ${{ matrix.application.AccountId }}"
+          echo "AccountName: ${{ matrix.application.AccountName }}"
+
+      - name: Get GitHub Apps Token # This enables access to Terraform modules in internal/private repos
+        id: get_token
+        uses: tibdex/github-app-token@v1.7.0
+        with:
+          private_key: ${{ secrets.ORG_REPO_READ_PRIVATE_KEY }}
+          app_id: ${{ secrets.ORG_REPO_READ_APP_ID }}
+        # Doc: https://github.com/marketplace/actions/github-app-token
+
+      - name: Configure AWS Credentials for reading state
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ matrix.application.AccountId }}:role/github-workflow-role-tf-ami-deployer
+          role-session-name: tf-ami-deployer-pipeline
+          aws-region: us-west-2
+ 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2.0.3
+        with:
+          terraform_version: "v1.5.7"
+
+      - name: Enable Terraform Git actions to use Github Apps Token
+        uses: de-vri-es/setup-git-credentials@v2.0.9
+        with:
+          credentials: https://git:${{ steps.get_token.outputs.token }}@github.com
+        # Doc: https://maelvls.dev/gh-actions-with-tf-private-repo/
+
+      - name: Upload SDLC Archive to S3 for ${{ matrix.application.Application }}
+        if: inputs.update-sdlc == 'true'
+        id: upload-sdlc
+        run: |
+            git clone git@github.com:AllegiantTravelCo/sdlc_deploy.git
+            tar czvf /tmp/sdlc_deploy.tar sdlc_deploy
+            folder_name=$(grep deployment_name tfvars/terraform-global.tfvars|awk -F "=" '/deployment_name/ { print $2 }'| tr -d ' "')
+            echo $folder_name
+            aws s3 cp /tmp/sdlc_deploy.tar s3://${{ matrix.application.AccountId }}-us-west-2-deployment-archive/$folder_name/
+            rm -rf /tmp/sdlc_deploy.tar
+            rm -rf sdlc_deploy
+        working-directory: ${{ matrix.application.Path }}
+        
+      - name: Terraform Init for ${{ matrix.application.Application }}
+        id: init
+        run: |
+          # Fully dynamic backend, no backend file(s) required.
+          echo Working directory is $(pwd)
+          terraform init -reconfigure \
+          -backend-config="bucket=${{ matrix.application.AccountId }}-tf-remote-state" \
+          -backend-config="region=us-west-2" \
+          -backend-config="dynamodb_table=tf-state-lock" \
+          -backend-config="encrypt=true" \
+          -backend-config="key=tf/ami-deployers/${{ matrix.application.Application }}"
+
+        working-directory: ${{ matrix.application.Path }}
+
+      - name: Terraform Plan for ${{ matrix.application.Application }}
+        if: inputs.subEnvironment != 'null' && inputs.tier == 'null'
+        id: plan-subenv
+        run: |
+          pip3 install boto3
+          terraform plan -var-file=tfvars/terraform-global.tfvars -var-file=tfvars/terraform-${{ inputs.subEnvironment }}.tfvars -out=plan.out
+        working-directory: ${{ matrix.application.Path }}
+
+      - name: Terraform Plan for ${{ matrix.application.Application }}
+        if: inputs.tier != 'null' && inputs.subEnvironment == 'null'
+        id: plan-tier
+        run: |
+          terraform plan -var-file=tfvars/terraform-global.tfvars -var-file=tfvars/terraform-${{ inputs.tier }}.tfvars -out=plan.out
+        working-directory: ${{ matrix.application.Path }}
+
+      - name: Terraform Apply for ${{ matrix.application.Application }}
+        if: inputs.auto-approve == 'true'
+        id: apply
+        run: |
+          terraform apply -input=false -no-color plan.out
+        working-directory: ${{ matrix.application.Path }}
+
+  ##############################################
+  deploy-matrix:
+    name: "Deploy Applications Group ${{ needs.parse-and-build.outputs.nextLayer }} in ${{inputs.SubEnvironment}}"
+    runs-on: ubuntu-latest
+    if: github.event.inputs.currentLayer < needs.parse-and-build.outputs.layerCount
+    needs:
+      - parse-and-build
+      - terraform-apply
+    steps:
+      - name: Deploy Sub-Environment ${{ github.event.inputs.subEnvironment }} - Layer ${{ needs.parse-and-build.outputs.nextLayer }}
+        uses: benc-uk/workflow-dispatch@v1
+        with:
+          workflow: deploy-matrix.yaml
+          inputs: |
+            {
+              "subEnvironment":
+                  "${{ github.event.inputs.SubEnvironment }}",
+              "matrix":
+                  ${{ toJson(github.event.inputs.matrix) }},
+              "currentLayer":
+                  "${{ needs.parse-and-build.outputs.nextLayer }}",
+              "type":
+                  "${{ github.event.inputs.type }}",
+              "tier":
+                  "${{ github.event.inputs.tier }}",
+              "auto-approve":
+                  "${{ github.event.inputs.auto-approve }}",
+              "update-sdlc":
+                  "${{ github.event.inputs.update-sdlc }}"
+            }
