@@ -1,0 +1,9 @@
+create symbolic links as below
+backends ../../../../shim/backends/
+data.tf  ../../../../shim/generic-deployer/data.tf
+generic-locals.tf  ../../../../shim/generic-deployer/locals.tf
+iam.tf  ../../../../shim/generic-deployer/iam.tf
+jboss-standalone-variables.tf ../../../../shim/variables/jboss-standalone-variables.tf
+main.tf ../../../../shim/generic-deployer/main.tf
+providers.tf ../../../../shim/generic-deployer/providers.tf
+variables.tf  ../../../../shim/generic-deployer/variables.tf
