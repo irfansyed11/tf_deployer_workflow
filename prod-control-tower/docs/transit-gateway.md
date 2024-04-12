@@ -3,6 +3,7 @@
 We use transit gateway as a centralized router that connects all of our VPCs. In this  scenario, all attachments are associated with the transit gateway default route table and propagate to the transit gateway default route table. Therefore, all attachments can route packets to each other, with the transit gateway serving as a simple layer 3 IP router.
 
 ![Transit Gateway Centralized](transit-gateway-centralized.png)
+![image](https://github.com/irfansyed11/tf_deployer_workflow/assets/48002646/8d0a4fdd-d325-460a-a620-ffbc04b7a106)
 
 Pattern via https://docs.aws.amazon.com/vpc/latest/tgw/transit-gateway-centralized-router.html
 
