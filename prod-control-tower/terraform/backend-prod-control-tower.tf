@@ -5,7 +5,23 @@ provider "aws" {
     key_prefixes = ["AutoTag_"]
   }
 }
+provider "aws" {
+  alias  = "us-east-2"
+  region = "us-east-2"
 
+  ignore_tags {
+    key_prefixes = ["AutoTag_"]
+  }
+}
+
+terraform {
+  required_providers {
+    aws = {
+      source = "hashicorp/aws"
+      # version = "~> 4.29"
+    }
+  }
+}
 terraform {
   backend "s3" {
     encrypt        = "true"
